@@ -3,6 +3,7 @@ import os
 import time
 import subprocess
 import yaml
+import glob
 import os
 import random
 import sys
@@ -13,6 +14,9 @@ import fnmatch
 import copy
 import calendar
 import json
+import shutil
+import re
+import random
 from pprint import pprint
 from prettytable import PrettyTable
 from datetime import datetime, timedelta
@@ -24,9 +28,32 @@ DESCRIPTION='''Backup data in a rotation mode.'''
 
 TIMEFORMAT = "%Y-%m-%dT%H:%M:%S"
 
+DEFAULT_BACKUP_EXCLUDE='''
+/home/*/.cache
+/root/.cache
+/home/*/.gvfs
+/home/*/.mozilla/firefox/*/Cache
+/home/*/.cache/chromium
+/home/*/.thumbnails
+/home/*/.npm/_cacache
+/var/tmp
+/dev
+/run
+/tmp
+'''
+
 DEFAULT_CONFIG='''## rsync-rotate-backup config file
+# must be gnu cp that have '-l, --link' option, install gnu utiles in OSX and change it
+CP: /bin/cp
+# you must have RSYNC to do backup
+RSYNC: /usr/bin/rsync
+
+# must starts with .., and must not end with /
+diffDir: ../backup-deleteing
+deleteDiff: True
+
 interval: 1s # min interval of two auto rotate backup
-max-age: 2y # max age of one auto rotate backup
+max-age: 10y # max age of one auto rotate backup
 
 # how long will backup stay at xx level. if 0, will stay forever
 max-year: 5
@@ -35,6 +62,7 @@ max-week: 6
 max-day: 7
 max-hour: 24
 max-minute: 60
+max-second: 60
 
 # the interval in xx level. if 0, do not delete old backups at this level. Should less than max-xx.
 interval-year: 1
@@ -42,8 +70,8 @@ interval-month: 1
 interval-week: 1
 interval-day: 1
 interval-hour: 3
-interval-minute: 30
-
+interval-minute: 10
+interval-second: 0
 
 # the start value of each xx
 start-month:     1 # 1~12
@@ -81,6 +109,18 @@ def check_config(*, config=None):
   name = 'second'
   if not (c['start-{}'.format(name)]>=0 and c['start-{}'.format(name)]<=59):
     raise Exception('range of start-{} not correct!'.format(name))
+  CP = c['CP']
+  ps, stdout, stderr = do_shell([CP, '--help'])
+  stdlines = stdout.split('\n')
+  cpVersionGood = list(filter(lambda _:_.startswith('  -l, --link'), stdlines))
+  if not len(cpVersionGood):
+    raise Exception('cp program with "-l, --link" options not exists!')
+  RSYNC = c['RSYNC']
+  if not os.path.exists(RSYNC):
+    raise Exception('need rsync to backup!')
+  if not c['diffDir'].startswith('..') or c['diffDir'].endswith('/'):
+    raise Exception('wrong format of diffDir! see comments in the config file')
+
 
 parser = argparse.ArgumentParser(
   description=DESCRIPTION,
@@ -90,18 +130,33 @@ parser = argparse.ArgumentParser(
 subparsers = parser.add_subparsers(help='', dest='subparser_name')
 
 init_parser = subparsers.add_parser('init', help='init a backup directory')
-backup_parser = subparsers.add_parser('backup', help='make a new backup')
+backup_parser = subparsers.add_parser('backup', help='make a new backup and generate clean list')
+clean_parser = subparsers.add_parser('clean', help='only generate clean list')
 init_parser.add_argument('dest', type=str, help='''init a backup directory''', nargs=1)
 init_parser.add_argument(
   '--force',
   action="store_const", const=True, default=False,
   help='''replace exists config.yml with the default configuration''',
   )
+
 backup_parser.add_argument('src', type=str, help='srouce directory to be backuped', nargs=1)
 backup_parser.add_argument('dest', type=str, help='''root directory to put the backups
 should be a empty folder, a folder init from --init command or a non-exists folder''', nargs=1)
+backup_parser.add_argument(
+  '--do-clean',
+  action="store_const", const=True, default=False,
+  help='''clean old backups''',
+  )
+
+clean_parser.add_argument('dest', type=str, help='''init a backup directory''', nargs=1)
+clean_parser.add_argument(
+  '--do-clean',
+  action="store_const", const=True, default=False,
+  help='''clean old backups''',
+  )
 
 unitNameMap = {
+  'second': 's',
   'minute': 'm',
   'hour': 'h',
   'day': 'd',
@@ -133,51 +188,101 @@ def delete_by_max_age(to_reserve, to_delete, now=None, config=None):
   this_to_reserve = []
   this_to_delete = []
   oldest_time = now - process_delta_time(config['max-age'])
+  logs = ['  older than {}({})'.format(oldest_time.strftime(TIMEFORMAT), config['max-age'])]
   for eachfile in to_reserve:
     if eachfile['timestamp'] <= oldest_time:
       eachfile['reason'] = 'older than {}'.format(config['max-age'])
       this_to_delete.append(eachfile)
+      logs.append('    {}'.format(os.path.basename(eachfile['filename'])))
     else:
       this_to_reserve.append(eachfile)
-  return this_to_reserve, this_to_delete
+  info = {
+    'name': 'max-age',
+    'config': config['max-age'],
+    'parameters': {
+      'start': oldest_time.strftime(TIMEFORMAT),
+      'end':   now.strftime(TIMEFORMAT),
+      },
+    'counts': {
+      'total': len(this_to_reserve) + len(this_to_delete),
+      'reserve': len(this_to_reserve),
+      'delete': len(this_to_delete),
+      },
+    'logs': logs,
+  }
+  return this_to_reserve, this_to_delete, info
 def delete_by_min_interval(to_reserve, to_delete, now=None, config=None):
   this_to_reserve = []
   min_delta = process_delta_time(config['interval'])
+  logs = ['  interval too small({})'.format(config['interval'])]
+  info = {
+    'name': 'min-interval',
+    'config': config['interval'],
+  }
   if len(to_reserve) <= 1:
-    return to_reserve, to_delete
+    info['logs'] = logs
+    return to_reserve, to_delete, info
   this_to_reserve.append(to_reserve[0])
   thisindex = 0
   nextindex = 1
+  too_close_dict = {}
   while nextindex < len(to_reserve):
     thisfile = to_reserve[thisindex]
     nextfile = to_reserve[nextindex]
     if thisfile['timestamp'] - min_delta < nextfile['timestamp']: # should delete nextfile
       nextfile['reason'] = 'interval: {}, too near with {}'.format(config['interval'], thisfile['timestampStr'])
       to_delete.append(nextfile)
+      if too_close_dict.get(os.path.basename(thisfile['filename'])) is None:
+        too_close_dict[os.path.basename(thisfile['filename'])] = [ os.path.basename(nextfile['filename']) ]
+      else:
+        too_close_dict[os.path.basename(thisfile['filename'])].append(os.path.basename(nextfile['filename']))
       nextindex += 1
     else: # should reserve nextfile and set it to thisindex
       this_to_reserve.append(nextfile)
       thisindex = nextindex
       nextindex += 1
-  return this_to_reserve, to_delete
+  for key in too_close_dict:
+    logs.append('    too close with {}'.format(key))
+    for value in too_close_dict[key]:
+      logs.append('      {}'.format(value))
+  info['counts'] = {
+    'total': len(this_to_reserve) + len(to_delete),
+    'reserve': len(this_to_reserve),
+    'delete': len(to_delete),
+    }
+  info['logs'] = logs
+  return this_to_reserve, to_delete, info
 def delete_in_levels(to_reserve, to_delete, config=None):
   this_to_reserve = copy.deepcopy(to_reserve)
   lg = last_good_file = to_reserve[0]['timestamp']
-  for level in ['minute', 'hour', 'day', 'week', 'month', 'year']:
-    max_length = str(config.get('max-{}'.format(level), 0))
-    interval   = str(config.get('interval-{}'.format(level), 0))
-    if max_length==0 or interval ==0:
+  info = {
+    'name': 'by-level',
+    'config': {},
+    'levels': {}
+  }
+  for level in ['second', 'minute', 'hour', 'day', 'week', 'month', 'year']:
+    max_length_raw = max_length = str(config.get('max-{}'.format(level), 0))
+    intervalStr = interval   = str(config.get('interval-{}'.format(level), 0))
+    info['config']['interval-{}'.format(level)] = intervalStr
+    info['config']['max-{}'.format(level)] = max_length
+    info['levels'][level] = {}
+    if max_length=='0' or interval == '0':
       continue
     max_length = process_delta_time(str(max_length) + unitNameMap[level])
     interval = process_delta_time(str(interval) + unitNameMap[level])
-    if level == 'minute':
+    if level == 'second':
       true_start = datetime(
         year=lg.year, month=lg.month, day=lg.day, hour=lg.hour,
         minute=lg.minute, second=config.get('start-second')
       )
-    elif level == 'hour':
+    elif level == 'minute':
       true_start = datetime(
         year=lg.year, month=lg.month, day=lg.day, hour=lg.hour,
+        minute=config.get('start-minute'), second=config.get('start-second')
+      )
+    elif level == 'hour':
+      true_start = datetime(
+        year=lg.year, month=lg.month, day=lg.day, hour=config.get('start-hour'),
         minute=config.get('start-minute'), second=config.get('start-second')
       )
     elif level == 'day':
@@ -211,18 +316,26 @@ def delete_in_levels(to_reserve, to_delete, config=None):
 
     #  |one interval|one interval|one interval|one interval|....|one interval|
     #           lg [true_start,  o,           o,           o,...o,    true_end, max_end], other...
+    if lg > true_start:
+      while lg > true_start:
+        true_start = true_start + interval
     while lg < true_start:
       true_start = true_start - interval
     max_end = true_start - max_length
     end = true_start
-    intervals = [(true_start, lg)]
+    intervals = [(true_start, true_start+interval)]
     # true start is the latest
+
     while end - interval >= max_end:
       right = end
       end = end - interval
       left = end
       true_end = end # the oldest
       intervals.append((left, right))
+    info['levels'][level]['intervals'] = intervals
+    info['levels'][level]['result'] = []
+    info['levels'][level]['interval'] = intervalStr
+    info['levels'][level]['interval_max'] = max_length_raw
     # not processed in this level
     this_level_to_reserve = list(filter(lambda _:_['timestamp']>lg or _['timestamp']<=true_end, this_to_reserve))
     to_process = list(filter(lambda _:_['timestamp']<=lg and _['timestamp']>true_end, this_to_reserve))
@@ -232,22 +345,41 @@ def delete_in_levels(to_reserve, to_delete, config=None):
     ##print('  to_process_length: {}, reserve_length:{}, total_length:{}'.format(len(to_process), len(this_level_to_reserve), len(this_to_reserve)))
     processed_reserve = []
     # in this_level_to_process
-    for left, right in intervals:
+    last_good_index = -1
+    last_good_right = intervals[0][1]
+    for index, (left, right) in enumerate(intervals):
       # in each interval, only have one
       this_files = list(filter(lambda _:_['timestamp']>left and _['timestamp']<=right, to_process))
       if len(this_files):
         this_files.sort(key=lambda _:_['timestamp'])
-        r = this_files[-1]
-        d = this_files[:-1]
+        this_files.reverse()
+        r = this_files[0]
+        d = this_files[1:]
         processed_reserve.append(r)
+
+        interval_counts = index - last_good_index
+        last_good_index = index
+        right = last_good_right
+        last_good_right = left
+
         for each in d:
-          each['reason'] = 'level: {}, {} ~ {} only use {}'.format(
+          each['reason'] = 'level: {} {}s, {} ~ {} only use {}'.format(
+            intervalStr,
             level,
             left.strftime(TIMEFORMAT),
             right.strftime(TIMEFORMAT),
             r['timestamp'].strftime(TIMEFORMAT),
           )
           to_delete.append(each)
+        info['levels'][level]['result'].append({
+          'left': left,
+          'right': right,
+          'interval_counts': interval_counts,
+          'reserve': r,
+          'delete': d
+        })
+      else: # no backups in this interval
+        pass
     this_level_to_reserve.extend(processed_reserve)
     if len(processed_reserve):
       processed_reserve.sort(key = lambda _:_['timestamp'])
@@ -259,48 +391,15 @@ def delete_in_levels(to_reserve, to_delete, config=None):
   this_to_reserve.reverse()
   to_delete.sort(key=lambda _:_['timestamp'])
   to_delete.reverse()
-  return this_to_reserve, to_delete
-def get_clean_list(output, config=None, now=None):
-  ## get old backups
-  autoclean = {}
-  rootpath = os.path.join(output, 'backup', 'auto')
-  for root, dirs, files in os.walk(rootpath):
-    relpath = os.path.relpath(root, rootpath)
-    if len(files):
-      fileinfo = []
-      for eachfile in files:
-        if not eachfile.endswith('.gz'):
-          continue
-        timestampStr = eachfile.split('|')[-1].split('_')[0]
-        timestamp = datetime.strptime(timestampStr, TIMEFORMAT)
-        fileinfo.append({
-          'filename': os.path.join(root, eachfile),
-          'timestampStr': timestampStr,
-          'timestamp': timestamp,
-        })
-
-      autoclean[relpath] = {
-        'raw': fileinfo,
-        'to_delete': None,
-        'to_reserve': None,
-      }
-  for eachpath in autoclean:
-    todo = autoclean[eachpath]
-    raw = todo['raw']
-    raw.sort(key=lambda _:_['timestamp'])
-    raw.reverse()
-    to_delete = []
-    to_reserve = copy.deepcopy(raw)
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
-    to_reserve, to_delete = delete_in_levels(to_reserve, to_delete, config=config)
-    autoclean[eachpath]['to_delete'] = to_delete
-    autoclean[eachpath]['to_reserve'] = to_reserve
-  return autoclean
+  return this_to_reserve, to_delete, info
 def do_unittest(config=None):
   now = datetime(year=2019, month=9, day=9, hour=13, minute=37, second=24)
-  def gen_time(N, interval, fileinfo):
+  random.seed(132412341423)
+  def gen_time(N, interval, fileinfo, p=1):
     for i in range(N):
+      if p<1:
+        if random.random() > p:
+          continue
       timestamp = now - i * interval
       timestampStr = timestamp.strftime(TIMEFORMAT)
       fileinfo.append({
@@ -315,7 +414,7 @@ def do_unittest(config=None):
   gen_time(120, process_delta_time('1m'), fileinfo)
   gen_time(48,  process_delta_time('1h'), fileinfo)
   gen_time(60,  process_delta_time('1d'), fileinfo)
-  gen_time(12,   process_delta_time('1w'), fileinfo)
+  gen_time(12,  process_delta_time('1w'), fileinfo)
   gen_time(24,  process_delta_time('1M'), fileinfo)
   gen_time(10,  process_delta_time('1y'), fileinfo)
   fileinfo_set = {_['filename']:_ for _ in fileinfo}
@@ -327,148 +426,162 @@ def do_unittest(config=None):
   if 'test max-age':
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '1m'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 1 and len(to_delete) == N-1
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '10m'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 10 and len(to_delete) == N-10
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '90m'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 90 and len(to_delete) == N-90
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '2h'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 120 and len(to_delete) == N-120
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '3h'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 121 and len(to_delete) == N-121
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '5h'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 123 and len(to_delete) == N-123
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '1d'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 142 and len(to_delete) == N-142
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '2d'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 166 and len(to_delete) == N-166
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '3d'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 167 and len(to_delete) == N-167
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '7d'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 171 and len(to_delete) == N-171
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-age'] = '14d'
-    to_reserve, to_delete = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 178 and len(to_delete) == N-178
   if 'test interval':
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '1m'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N and len(to_delete) == 0
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '2m'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 60 and len(to_delete) == 60
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '3m'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 80 and len(to_delete) == 80
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '10m'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 108 and len(to_delete) == 108
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '1h'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 118 and len(to_delete) == 118
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '2h'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 142 and len(to_delete) == 142
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '3h'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 150 and len(to_delete) == 150
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '8h'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 160 and len(to_delete) == 160
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '1d'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 164 and len(to_delete) == 164
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '2d'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 195 and len(to_delete) == 195
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '3d'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 205 and len(to_delete) == 205
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '1w'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 216 and len(to_delete) == 216
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '2w'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 222 and len(to_delete) == 222
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '3w'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 224 and len(to_delete) == 224
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '1M'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 225 and len(to_delete) == 225
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '3M'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 241 and len(to_delete) == 241
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '1y'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == N - 247 and len(to_delete) == 247
 
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['interval'] = '3y'
-    to_reserve, to_delete = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+    to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
     assert len(to_reserve) == 4 and len(to_delete) == N - 4
+
+
+  fileinfo = []
+  gen_time(120, process_delta_time('1m'), fileinfo, p=0.1)
+  gen_time(48,  process_delta_time('1h'), fileinfo, p=0.3)
+  gen_time(60,  process_delta_time('1d'), fileinfo, p=0.3)
+  gen_time(12,  process_delta_time('1w'), fileinfo, p=0.3)
+  gen_time(24,  process_delta_time('1M'), fileinfo, p=0.3)
+  gen_time(10,  process_delta_time('1y'), fileinfo, p=0.3)
+  fileinfo_set = {_['filename']:_ for _ in fileinfo}
+  fileinfo = list(fileinfo_set.values())
+  fileinfo.sort(key=lambda _:_['timestamp'])
+  fileinfo.reverse()
+  N = len(fileinfo)
   if 'test level':
     to_delete = []; to_reserve = copy.deepcopy(fileinfo);
     config['max-year']  = 5
@@ -482,19 +595,20 @@ def do_unittest(config=None):
     config['interval-week']   = 2
     config['interval-day']    = 2
     config['interval-hour']   = 3
-    config['interval-minute'] = 20
+    config['interval-minute'] = 10
     config['start-month']     = 1 # 1~12
     config['start-day-month'] = 1 # 1~28, can be negitave
-    config['start-day-week']  = 0 # 1~7
+    config['start-day-week']  = 1 # 1~7
     config['start-hour']      = 0 # 0~59
     config['start-minute']    = 0 # 0~59
     config['start-second']    = 0 # 0~59
-    to_reserve, to_delete = delete_in_levels(to_reserve, to_delete, config=config)
+    to_reserve, to_delete, info = delete_in_levels(to_reserve, to_delete, config=config)
 
-
-  print(len(to_delete))
+  level_log = parseLevelInfo(info)
+  print(level_log)
   import ipdb
   ipdb.set_trace()
+
 def print_config(config):
   print('  interval: {interval}, max-age:{max-age}'.format(**config))
   toPrints = [
@@ -527,75 +641,200 @@ def print_config(config):
   ]
   p = ['{key}:{value}'.format(key=_,value=config[_]) for _ in toPrints]
   print('  '+', '.join(p))
-
-def do_backup(*, config=None, now=None):
-  dest = config['dest']
-  src = config['src']
-  logfile = os.path.join(dest, 'log.log')
-  timestamp = now.strftime(TIMEFORMAT)
-
-  backup_path = os.path.join( dest, timestamp)
-  os.mkdir(backup_path)
-  cmd = '''mysqldump {backup_login} {backup_args} {backup_obj} | gzip > "{filename}"'''.format(**locals())
-  print(pcmd)
-  time0 = time.time()
-  print('start to backup with: {backup_obj}'.format(**locals()))
-  ps = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-  stdout = ps.stdout.read().decode()
-  stderr = ps.stderr.read().decode()
-  if stdout or stderr:
-    print('stdout:', stdout)
-    print('stderr:', stderr)
-    print('have error!')
-    if os.path.exists(filename):
-      os.remove(filename)
-      print('delete file:\n  ', filename)
-      dirname = os.path.dirname(filename)
-      if not os.listdir(dirname):
-        os.rmdir(dirname)
-        print('delete empty folder:\n  ', dirname)
-    sys.exit(1)
+def do_shell(args, printing=False):
+  ps = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
+  stdout = []
+  stderr = []
+  if printing:
+    for line in iter(ps.stdout.readline, b''):
+      sys.stdout.buffer.write(line)
+      stdout.append(line)
+    for line in iter(ps.stderr.readline, b''):
+      sys.stderr.buffer.write(line)
+      stderr.append(line)
+  ps.wait()
+  if printing:
+    stdout = b''.join(stdout)
+    stderr = b''.join(stderr)
+    stdout = stdout.decode()
+    stderr = stderr.decode()
   else:
-    print('finish backup in {:.1f}s'.format(time.time() - time0))
-  print('=======log=======')
+    stdout = ps.stdout.read().decode()
+    stderr = ps.stderr.read().decode()
+  return ps, stdout, stderr
+
+def parseLevelInfo(info):
+  levels = info['levels']
+  prefix = '  '
+  output = []
+  for level in levels:
+    interval = levels[level].get('interval', '')
+    interval_max = levels[level].get('interval_max', '')
+    if interval:
+      output.append("  {level:10} interval:{interval} max: {interval_max}".format(**locals()))
+    else:
+      output.append("  {level:10}".format(**locals()))
+    intervals = levels[level].get('result')
+    if not intervals: continue
+    for interval in intervals:
+      interval_counts = interval['interval_counts']
+      left = interval['left']
+      right = interval['right']
+      reserve = os.path.basename(interval['reserve']['filename'])
+      delete  = list(map(lambda _:_['filename'], interval['delete']))
+      leftStr  = left.strftime(TIMEFORMAT)
+      rightStr = right.strftime(TIMEFORMAT)
+      output.append("    [{interval_counts:2d}] {leftStr} ~ {rightStr} | {reserve}".format(**locals()))
+      for each in delete:
+        output.append("      {each}".format(**locals()))
+  return '\n'.join(output)
+
+backupPattern = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}')
+def get_clean_list(output, config=None, now=None):
+  ## get old backups
+  rootpath = os.path.join(output)
+  files = glob.glob(os.path.join(output, '*T*'))
+  files = list(filter(lambda _:backupPattern.match(os.path.basename(_)), files))
+
+  autoclean = {}
+  fileinfo = []
+  for dirname in files:
+    basename = os.path.basename(dirname)
+    timestampStr = basename
+    timestamp = datetime.strptime(timestampStr, TIMEFORMAT)
+    fileinfo.append({
+      'filename': dirname,
+      'timestampStr': timestampStr,
+      'timestamp': timestamp,
+    })
+
+  raw = fileinfo
+  raw.sort(key=lambda _:_['timestamp'])
+  raw.reverse()
+  to_delete = []
+  to_reserve = copy.deepcopy(raw)
+  logs = []
+  to_reserve, to_delete, info = delete_by_max_age(to_reserve, to_delete, now=now, config=config)
+  max_age_logs = info['logs']
+  to_reserve, to_delete, info = delete_by_min_interval(to_reserve, to_delete, now=now, config=config)
+  min_interval_logs = info['logs']
+  to_reserve, to_delete, info = delete_in_levels(to_reserve, to_delete, config=config)
+  level_logs = parseLevelInfo(info)
+  logs.append(level_logs)
+  logs.append('\n'.join(max_age_logs))
+  logs.append('\n'.join(min_interval_logs))
+  autoclean['to_delete'] = to_delete
+  autoclean['to_reserve'] = to_reserve
+  autoclean['log'] = '\n'.join(logs)
+  return autoclean
+
+def main(*, config=None, now=None, action=None, doClean=None):
+  timestampStr = now.strftime(TIMEFORMAT)
+
+  dest = config['dest']
+  CP = config['CP']
+  RSYNC = config['RSYNC']
+  diffDir = '{}-{}'.format(config['diffDir'], timestampStr)
+  deleteDiff = config['deleteDiff']
+
+  logfile = os.path.join(dest, 'log.log')
+
+  currentDir = os.path.join(dest, 'current/')
+  currentWorkingDir = os.path.join(dest, 'current-working/')
+  destDir = os.path.join(dest, timestamp)
+  backupExcludeFile = os.path.join(dest, 'backupExclude.conf')
+
+  if action == 'backup':
+    src = config['src']
+    srcDir = src
+
+    if not os.path.exists(currentDir): # rsync to a empty current dir
+      ps, stdout, stderr = do_shell([
+        RSYNC,
+        '--delete', '--backup', '--backup-dir={}'.format(diffDir),
+        '--exclude-from={}'.format(backupExcludeFile),
+        '-alP', srcDir, currentDir,
+      ], printing=True)
+      if ps.returncode != 0:
+        raise Exception(stderr)
+      rsync_stdout = stdout
+      with open(os.path.join(currentDir, 'log.log'), 'a') as f:
+        f.write(stdout)
+      if deleteDiff:
+        if os.path.exists(os.path.join(currentDir, diffDir)):
+          shutil.rmtree(os.path.join(currentDir, diffDir))
+      ps, stdout, stderr = do_shell([
+        CP, '-al', currentDir, destDir,
+      ])
+      if ps.returncode != 0:
+        raise Exception(stderr)
+    else: # rsync to a exists current dir
+      if os.path.exists(currentWorkingDir):
+        shutil.rmtree(currentWorkingDir)
+      ps, stdout, stderr = do_shell([
+        CP, '-al', currentDir, currentWorkingDir,
+      ])
+      if ps.returncode != 0:
+        raise Exception(stderr)
+      ps, stdout, stderr = do_shell([
+        RSYNC,
+        '--delete', '--backup', '--backup-dir={}'.format(diffDir),
+        '--exclude-from={}'.format(backupExcludeFile),
+        '-alP', srcDir, currentWorkingDir,
+      ], printing=True)
+      if ps.returncode != 0:
+        raise Exception(stderr)
+      rsync_stdout = stdout
+      with open(os.path.join(currentWorkingDir, 'log.log'), 'a') as f:
+        f.write(stdout)
+      if deleteDiff:
+        if os.path.exists(os.path.join(currentDir, diffDir)):
+          shutil.rmtree(os.path.join(currentDir, diffDir))
+      ps, stdout, stderr = do_shell([
+        CP, '-al', currentWorkingDir, destDir,
+      ])
+      if ps.returncode != 0:
+        raise Exception(stderr)
+      shutil.rmtree(currentDir)
+      os.rename(currentWorkingDir, currentDir)
+
   ## clean old backups
-  cleanList = get_clean_list(output, config=config, now=now)
+  autoClean = get_clean_list(dest, config=config, now=now)
 
   ## write to log
-  LOG_TEMPLAGE="{timestamp} {command} "
-  log = LOG_TEMPLAGE.format(
-    timestamp=timestamp,
-    command=config['command'],
-  ) + "{name} {filename}".format(
-    filename=os.path.basename(filename),
-    name='name:'+c.get('name') if c.get('name') else 'auto',
-  )
-  logs = [log]
-  for eachdir in cleanList:
-    if len(cleanList[eachdir]['to_delete']):
-      logs.append('  clean {}'.format(eachdir))
-      for eachfile in cleanList[eachdir]['to_delete']:
-        os.remove(eachfile['filename'])
-        logs.append('    delete '+eachfile['filename'])
-        logs.append('      '+eachfile['reason'])
-
-  log = '\n'.join(logs)
-  if os.path.exists(logfile):
-    with open(logfile, 'a') as f:
-      f.write('\n' + log)
+  logs = []
+  if action == 'backup':
+    rsync_log = rsync_stdout.split('\n')
+    rsync_log = list(filter(lambda _:_, rsync_log))
+    if len(rsync_log):
+      rsync_log = '\n  '+rsync_log[-1]
+    else:
+      rsync_log = ''
   else:
-    with open(logfile, 'a') as f:
-      f.write(log)
+    rsync_log = ''
+  LOG_TEMPLAGE="{timestampStr} action:{action} do-clean:{doClean}{rsync_log}\n"
+  if len(autoClean['to_delete']):
+    #logs.append('  autoclean')
+    for eachfile in autoClean['to_delete']:
+      filename = os.path.basename(eachfile['filename'])
+      if doClean:
+        shutil.rmtree(eachfile['filename'])
+        #logs.append('    delete '+filename)
+        #logs.append('      '+eachfile['reason'])
+    #logs = '\n'.join(logs)
+  log = LOG_TEMPLAGE.format(**locals()) + autoClean['log']
+  if action=='backup' or (action=='clean' and doClean):
+    if os.path.exists(logfile):
+      with open(logfile, 'a') as f:
+        f.write('\n' + log)
+    else:
+      with open(logfile, 'a') as f:
+        f.write(log)
   print(log)
-def find_files(directory, pattern):
-  for root, dirs, files in os.walk(directory):
-    for basename in files:
-      if fnmatch.fnmatch(basename, pattern):
-        filename = os.path.join(root, basename)
-        yield filename
 
 if __name__ == '__main__':
   now = datetime.now()
+  timestamp = now.strftime(TIMEFORMAT)
   args = parser.parse_args()
   if not args.subparser_name:
     parser.print_help()
@@ -603,6 +842,7 @@ if __name__ == '__main__':
   dest = args.dest[0]
   os.makedirs(dest, exist_ok=True)
   configFile = os.path.join(dest, 'config.yml')
+  backupExcludeFile = os.path.join(dest, 'backupExclude.conf')
   if args.subparser_name == 'init': # do init
     if os.path.exists(configFile):
       if not args.force:
@@ -611,32 +851,50 @@ if __name__ == '__main__':
         print('replace config file {} with the default one'.format(configFile))
     else:
       print('generate new config file {}'.format(configFile))
+    if not os.path.exists(backupExcludeFile):
+      with open(backupExcludeFile, 'w') as f:
+        f.write('')
     # gen config file to configFile
     with open(configFile, 'w') as f:
       f.write(DEFAULT_CONFIG)
     sys.exit(0)
+  elif args.subparser_name == 'clean': # do init
+    if not os.path.exists(configFile):
+      raise Exception('no config file found: {}'.format(configFile))
+    print('use config file {} and do clean up'.format(configFile))
+    with open(configFile, 'r') as f:
+      config = yaml.safe_load(f)
   elif args.subparser_name == 'backup': # do init
-    dest = args.src[0]
+    src = args.src[0]
     if not os.path.exists(configFile):
       print('generate new config file {} and do backup'.format(configFile))
       with open(configFile, 'w') as f:
         f.write(DEFAULT_CONFIG)
     else:
       print('use config file {} and do backup'.format(configFile))
+    if not os.path.exists(backupExcludeFile):
+      with open(backupExcludeFile, 'w') as f:
+        f.write(DEFAULT_BACKUP_EXCLUDE)
     with open(configFile, 'r') as f:
       config = yaml.safe_load(f)
+
+    if src.endswith('/'):
+      config['src'] = src[:-1]
+    else:
+      config['src'] = src
   else:
     raise Exception('should not be here')
 
+  doClean = args.do_clean
   # check config file
   try:
     check_config(config=config)
   except Exception as e:
     raise Exception('Error in configfile: {}\n{}'.format(configFile, str(e)))
+  if dest.endswith('/'):
+    config['dest'] = dest[:-1]
+  else:
+    config['dest'] = dest
   #do_unittest(config=config)
-  config['src'] = src
-  config['dest'] = dest
-  print(timestamp)
-  print_config(config)
-  do_backup(config=config, now=now)
+  main(config=config, now=now, action=args.subparser_name, doClean=doClean)
 
