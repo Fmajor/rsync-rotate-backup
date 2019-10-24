@@ -29,17 +29,22 @@ DESCRIPTION='''Backup data in a rotation mode.'''
 TIMEFORMAT = "%Y-%m-%dT%H:%M:%S"
 
 DEFAULT_BACKUP_EXCLUDE='''
-/home/*/.cache
-/root/.cache
-/home/*/.gvfs
-/home/*/.mozilla/firefox/*/Cache
-/home/*/.cache/chromium
-/home/*/.thumbnails
-/home/*/.npm/_cacache
-/var/tmp
-/dev
-/run
-/tmp
+home/*/.cache
+root/.cache
+home/*/.gvfs
+home/*/.mozilla/firefox/*/Cache
+home/*/.cache/chromium
+home/*/.thumbnails
+home/*/.npm/_cacache
+var/tmp
+dev
+run
+tmp
+lost+found
+mnt
+proc
+swapadd
+swapfile
 '''
 
 DEFAULT_CONFIG='''## rsync-rotate-backup config file
@@ -51,6 +56,8 @@ RSYNC: /usr/bin/rsync
 # must starts with .., and must not end with /
 diffDir: ../backup-deleteing
 deleteDiff: True
+
+src: {src}
 
 interval: 1s # min interval of two auto rotate backup
 max-age: 10y # max age of one auto rotate backup
@@ -131,11 +138,12 @@ subparsers = parser.add_subparsers(help='', dest='subparser_name')
 
 init_parser = subparsers.add_parser('init', help='init a backup directory')
 backup_parser = subparsers.add_parser('backup', help='make a new backup and generate clean list')
+backup_from_parser = subparsers.add_parser('backup-from', help='make a new backup and generate clean list, get src from config file')
 clean_parser = subparsers.add_parser('clean', help='only generate clean list')
 init_parser.add_argument('dest', type=str, help='''init a backup directory''', nargs=1)
 init_parser.add_argument(
   '--force',
-  action="store_const", const=True, default=False,
+  action="store_true",
   help='''replace exists config.yml with the default configuration''',
   )
 
@@ -144,14 +152,21 @@ backup_parser.add_argument('dest', type=str, help='''root directory to put the b
 should be a empty folder, a folder init from --init command or a non-exists folder''', nargs=1)
 backup_parser.add_argument(
   '--do-clean',
-  action="store_const", const=True, default=False,
+  action="store_true",
+  help='''clean old backups''',
+  )
+
+backup_from_parser.add_argument('dest', type=str, help='''root directory to put the backups, should have config.yml inside''', nargs=1)
+backup_from_parser.add_argument(
+  '--do-clean',
+  action="store_true",
   help='''clean old backups''',
   )
 
 clean_parser.add_argument('dest', type=str, help='''init a backup directory''', nargs=1)
 clean_parser.add_argument(
   '--do-clean',
-  action="store_const", const=True, default=False,
+  action="store_true",
   help='''clean old backups''',
   )
 
@@ -641,8 +656,8 @@ def print_config(config):
   ]
   p = ['{key}:{value}'.format(key=_,value=config[_]) for _ in toPrints]
   print('  '+', '.join(p))
-def do_shell(args, printing=False):
-  ps = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
+def do_shell(args, printing=False, shell=False):
+  ps = subprocess.Popen(args, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
   stdout = []
   stderr = []
   if printing:
@@ -728,7 +743,7 @@ def get_clean_list(output, config=None, now=None):
   autoclean['log'] = '\n'.join(logs)
   return autoclean
 
-def main(*, config=None, now=None, action=None, doClean=None):
+def main(*, config=None, now=None, action=None, doClean=None, remote=None):
   timestampStr = now.strftime(TIMEFORMAT)
 
   dest = config['dest']
@@ -744,13 +759,14 @@ def main(*, config=None, now=None, action=None, doClean=None):
   destDir = os.path.join(dest, timestamp)
   backupExcludeFile = os.path.join(dest, 'backupExclude.conf')
 
-  if action == 'backup':
+  if action.startswith('backup'):
     src = config['src']
     srcDir = src
 
     if not os.path.exists(currentDir): # rsync to a empty current dir
       ps, stdout, stderr = do_shell([
         RSYNC,
+        '--stats',
         '--delete', '--backup', '--backup-dir={}'.format(diffDir),
         '--exclude-from={}'.format(backupExcludeFile),
         '-alP', srcDir, currentDir,
@@ -778,6 +794,7 @@ def main(*, config=None, now=None, action=None, doClean=None):
         raise Exception(stderr)
       ps, stdout, stderr = do_shell([
         RSYNC,
+        '--stats',
         '--delete', '--backup', '--backup-dir={}'.format(diffDir),
         '--exclude-from={}'.format(backupExcludeFile),
         '-alP', srcDir, currentWorkingDir,
@@ -803,16 +820,14 @@ def main(*, config=None, now=None, action=None, doClean=None):
 
   ## write to log
   logs = []
-  if action == 'backup':
+  if action.startswith('backup'):
     rsync_log = rsync_stdout.split('\n')
     rsync_log = list(filter(lambda _:_, rsync_log))
-    if len(rsync_log):
-      rsync_log = '\n  '+rsync_log[-1]
-    else:
-      rsync_log = ''
+    rsync_log = list(map(lambda _:'\n    '+_, rsync_log))
+    rsync_log = '\n  rsync statistic:'+''.join(rsync_log[-15:])
   else:
     rsync_log = ''
-  LOG_TEMPLAGE="{timestampStr} action:{action} do-clean:{doClean}{rsync_log}\n"
+  LOG_TEMPLAGE="{timestampStr} src:{srcDir} action:{action} do-clean:{doClean}{rsync_log}\n"
   if len(autoClean['to_delete']):
     #logs.append('  autoclean')
     for eachfile in autoClean['to_delete']:
@@ -823,7 +838,7 @@ def main(*, config=None, now=None, action=None, doClean=None):
         #logs.append('      '+eachfile['reason'])
     #logs = '\n'.join(logs)
   log = LOG_TEMPLAGE.format(**locals()) + autoClean['log']
-  if action=='backup' or (action=='clean' and doClean):
+  if action.startswith('backup') or (action=='clean' and doClean):
     if os.path.exists(logfile):
       with open(logfile, 'a') as f:
         f.write('\n' + log)
@@ -853,10 +868,10 @@ if __name__ == '__main__':
       print('generate new config file {}'.format(configFile))
     if not os.path.exists(backupExcludeFile):
       with open(backupExcludeFile, 'w') as f:
-        f.write('')
+        f.write(DEFAULT_BACKUP_EXCLUDE)
     # gen config file to configFile
     with open(configFile, 'w') as f:
-      f.write(DEFAULT_CONFIG)
+      f.write(DEFAULT_CONFIG.format(src=''))
     sys.exit(0)
   elif args.subparser_name == 'clean': # do init
     if not os.path.exists(configFile):
@@ -866,10 +881,12 @@ if __name__ == '__main__':
       config = yaml.safe_load(f)
   elif args.subparser_name == 'backup': # do init
     src = args.src[0]
+    if src.endswith('/'):
+      src = src[:-1]
     if not os.path.exists(configFile):
       print('generate new config file {} and do backup'.format(configFile))
       with open(configFile, 'w') as f:
-        f.write(DEFAULT_CONFIG)
+        f.write(DEFAULT_CONFIG.format(src=src))
     else:
       print('use config file {} and do backup'.format(configFile))
     if not os.path.exists(backupExcludeFile):
@@ -877,11 +894,38 @@ if __name__ == '__main__':
         f.write(DEFAULT_BACKUP_EXCLUDE)
     with open(configFile, 'r') as f:
       config = yaml.safe_load(f)
+    config['src'] = src
 
-    if src.endswith('/'):
-      config['src'] = src[:-1]
-    else:
-      config['src'] = src
+    if not os.path.exists(config['src']):
+      remote = False
+      if ':' in config['src']:
+        _ = config['src'].split(':')
+        host = _[0]
+        path = _[1:]
+        path = ':'.join(path)
+        ps, stdout, stderr = do_shell(['ssh', host, "ls {}".format(path)])
+        if ps.returncode == 0:
+          remote = True
+      if not remote:
+        raise Exception('source folder not exists: {}'.format(config['src']))
+  elif args.subparser_name == 'backup-from': # do init
+    if not os.path.exists(configFile):
+      raise Exception('no config file found: {}'.format(configFile))
+    print('use config file {} and do clean up'.format(configFile))
+    with open(configFile, 'r') as f:
+      config = yaml.safe_load(f)
+    if not os.path.exists(config['src']):
+      remote = False
+      if ':' in config['src']:
+        _ = config['src'].split(':')
+        host = _[0]
+        path = _[1:]
+        path = ':'.join(path)
+        ps, stdout, stderr = do_shell(['ssh', host, "ls {}".format(path)])
+        if ps.returncode == 0:
+          remote = True
+      if not remote:
+        raise Exception('source folder not exists: {}'.format(config['src']))
   else:
     raise Exception('should not be here')
 
@@ -896,5 +940,5 @@ if __name__ == '__main__':
   else:
     config['dest'] = dest
   #do_unittest(config=config)
-  main(config=config, now=now, action=args.subparser_name, doClean=doClean)
+  main(config=config, now=now, action=args.subparser_name, doClean=doClean, remote=remote)
 
