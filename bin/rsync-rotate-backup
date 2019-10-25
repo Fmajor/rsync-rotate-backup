@@ -124,7 +124,6 @@ def check_config(*, config=None):
   if not c['diffDir'].startswith('..') or c['diffDir'].endswith('/'):
     raise Exception('wrong format of diffDir! see comments in the config file')
 
-
 parser = argparse.ArgumentParser(
   description=DESCRIPTION,
   formatter_class=argparse.RawTextHelpFormatter,
