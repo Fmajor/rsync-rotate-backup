@@ -9,16 +9,12 @@ import random
 import sys
 import argparse
 import glob
-import humanize
-import fnmatch
 import copy
 import calendar
 import json
 import shutil
 import re
 import random
-from pprint import pprint
-from prettytable import PrettyTable
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from dateutil.parser import parser as time_parser
@@ -774,7 +770,7 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
       if ps.returncode != 0:
         raise Exception(stderr)
       rsync_stdout = stdout
-      with open(os.path.join(currentDir, 'log.log'), 'a') as f:
+      with open(os.path.join(currentDir, 'log.log'), 'w') as f:
         f.write(stdout)
       if deleteDiff:
         if os.path.exists(os.path.join(currentDir, diffDir)):
@@ -802,7 +798,8 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
       if ps.returncode != 0:
         raise Exception(stderr)
       rsync_stdout = stdout
-      with open(os.path.join(currentWorkingDir, 'log.log'), 'a') as f:
+      os.remove(os.path.join(currentWorkingDir, 'log.log'))
+      with open(os.path.join(currentWorkingDir, 'log.log'), 'w') as f:
         f.write(stdout)
       if deleteDiff:
         if os.path.exists(os.path.join(currentDir, diffDir)):
