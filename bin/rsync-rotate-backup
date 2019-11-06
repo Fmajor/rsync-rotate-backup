@@ -46,8 +46,7 @@ swapfile
 '''
 
 DEFAULT_CONFIG='''## rsync-rotate-backup config file
-# must be gnu cp that have '-l, --link' option, install gnu utiles in OSX and change it
-CP: /bin/cp
+
 # you must have RSYNC to do backup
 RSYNC: /usr/bin/rsync
 
@@ -55,10 +54,25 @@ RSYNC: /usr/bin/rsync
 diffDir: ../backup-deleteing
 deleteDiff: True
 
+# the backup source when use the 'backup-to' command, should be FULLPATH
 src: {src}
 
-interval: 1s # min interval of two auto rotate backup
-max-age: 10y # max age of one auto rotate backup
+
+# Each time, the script will list the old backups that should be deleted in log file.
+# if this is set to True, really delete these old backups
+do_clean: False
+
+## time units for below configs
+# s: second
+# m: minute
+# h: hour
+# d: day
+# w: week
+# M: month
+# y: year
+
+interval: 1m # min interval of two rotate backups
+max-age: 3y # max age of a rotate backup
 
 # how long will backup stay at xx level. if 0, will stay forever
 max-year: 5
@@ -69,13 +83,13 @@ max-hour: 24
 max-minute: 60
 max-second: 60
 
-# the interval in xx level. if 0, do not delete old backups at this level. Should less than max-xx.
+# the interval in xx level. if 0, do not delete old backups at this level. Should be less than max-xx.
 interval-year: 1
 interval-month: 1
 interval-week: 1
 interval-day: 1
 interval-hour: 3
-interval-minute: 10
+interval-minute: 1
 interval-second: 0
 
 # the start value of each xx
@@ -114,12 +128,6 @@ def check_config(*, config=None):
   name = 'second'
   if not (c['start-{}'.format(name)]>=0 and c['start-{}'.format(name)]<=59):
     raise Exception('range of start-{} not correct!'.format(name))
-  CP = c['CP']
-  ps, stdout, stderr = do_shell([CP, '--help'])
-  stdlines = stdout.split('\n')
-  cpVersionGood = list(filter(lambda _:_.startswith('  -l, --link'), stdlines))
-  if not len(cpVersionGood):
-    raise Exception('cp program with "-l, --link" options not exists!')
   RSYNC = c['RSYNC']
   if not os.path.exists(RSYNC):
     raise Exception('need rsync to backup!')
@@ -135,7 +143,7 @@ subparsers = parser.add_subparsers(help='', dest='subparser_name')
 
 init_parser = subparsers.add_parser('init', help='init a backup directory')
 backup_parser = subparsers.add_parser('backup', help='make a new backup and generate clean list')
-backup_from_parser = subparsers.add_parser('backup-from', help='make a new backup and generate clean list, get src from config file')
+backup_from_parser = subparsers.add_parser('backup-to', help='make a new backup and generate clean list, get src from config file')
 clean_parser = subparsers.add_parser('clean', help='only generate clean list')
 init_parser.add_argument('dest', type=str, help='''init a backup directory''', nargs=1)
 init_parser.add_argument(
@@ -200,7 +208,7 @@ def delete_by_max_age(to_reserve, to_delete, now=None, config=None):
   this_to_reserve = []
   this_to_delete = []
   oldest_time = now - process_delta_time(config['max-age'])
-  logs = ['  older than {}({})'.format(oldest_time.strftime(TIMEFORMAT), config['max-age'])]
+  logs = ['  delete by max-age {} older than {}'.format(config['max-age'], oldest_time.strftime(TIMEFORMAT))]
   for eachfile in to_reserve:
     if eachfile['timestamp'] <= oldest_time:
       eachfile['reason'] = 'older than {}'.format(config['max-age'])
@@ -208,6 +216,11 @@ def delete_by_max_age(to_reserve, to_delete, now=None, config=None):
       logs.append('    {}'.format(os.path.basename(eachfile['filename'])))
     else:
       this_to_reserve.append(eachfile)
+  logs = ['  delete {} by max-age {} older than {}'.format(
+    len(this_to_delete),
+    config['max-age'],
+    oldest_time.strftime(TIMEFORMAT)
+    )]
   info = {
     'name': 'max-age',
     'config': config['max-age'],
@@ -226,7 +239,7 @@ def delete_by_max_age(to_reserve, to_delete, now=None, config=None):
 def delete_by_min_interval(to_reserve, to_delete, now=None, config=None):
   this_to_reserve = []
   min_delta = process_delta_time(config['interval'])
-  logs = ['  interval too small({})'.format(config['interval'])]
+  logs = ['  delete by interval {}'.format(config['interval'])]
   info = {
     'name': 'min-interval',
     'config': config['interval'],
@@ -262,6 +275,7 @@ def delete_by_min_interval(to_reserve, to_delete, now=None, config=None):
     'reserve': len(this_to_reserve),
     'delete': len(to_delete),
     }
+  logs[0] = '  delete {} by mininum interval {}'.format(len(to_delete), config['interval'])
   info['logs'] = logs
   return this_to_reserve, to_delete, info
 def delete_in_levels(to_reserve, to_delete, config=None):
@@ -685,7 +699,7 @@ def parseLevelInfo(info):
     if interval:
       output.append("  {level:10} interval:{interval} max: {interval_max}".format(**locals()))
     else:
-      output.append("  {level:10}".format(**locals()))
+      output.append("  {level:10} (no backups in this level)".format(**locals()))
     intervals = levels[level].get('result')
     if not intervals: continue
     for interval in intervals:
@@ -694,9 +708,10 @@ def parseLevelInfo(info):
       right = interval['right']
       reserve = os.path.basename(interval['reserve']['filename'])
       delete  = list(map(lambda _:_['filename'], interval['delete']))
+      deleted = len(delete)
       leftStr  = left.strftime(TIMEFORMAT)
       rightStr = right.strftime(TIMEFORMAT)
-      output.append("    [{interval_counts:2d}] {leftStr} ~ {rightStr} | {reserve}".format(**locals()))
+      output.append("    [{interval_counts:2d}] {leftStr} ~ {rightStr} deleting:{deleted:3d} | use: {reserve}".format(**locals()))
       for each in delete:
         output.append("      {each}".format(**locals()))
   return '\n'.join(output)
@@ -744,7 +759,6 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
   timestampStr = now.strftime(TIMEFORMAT)
 
   dest = config['dest']
-  CP = config['CP']
   RSYNC = config['RSYNC']
   diffDir = '{}-{}'.format(config['diffDir'], timestampStr)
   deleteDiff = config['deleteDiff']
@@ -777,7 +791,8 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
         if os.path.exists(os.path.join(currentDir, diffDir)):
           shutil.rmtree(os.path.join(currentDir, diffDir))
       ps, stdout, stderr = do_shell([
-        CP, '-al', currentDir, destDir,
+        # CP, '-al', currentDir, destDir,
+        RSYNC, '-a', '--link-dest={}'.format(currentDir), currentDir, destDir,
       ])
       if ps.returncode != 0:
         raise Exception(stderr)
@@ -785,7 +800,7 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
       if os.path.exists(currentWorkingDir):
         shutil.rmtree(currentWorkingDir)
       ps, stdout, stderr = do_shell([
-        CP, '-al', currentDir, currentWorkingDir,
+        RSYNC, '-a', '--link-dest={}'.format(currentDir), currentDir, currentWorkingDir,
       ])
       if ps.returncode != 0:
         raise Exception(stderr)
@@ -799,14 +814,15 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
       if ps.returncode != 0:
         raise Exception(stderr)
       rsync_stdout = stdout
-      os.remove(os.path.join(currentWorkingDir, 'log.log'))
+      if os.path.exists(os.path.join(currentWorkingDir, 'log.log')):
+        os.remove(os.path.join(currentWorkingDir, 'log.log'))
       with open(os.path.join(currentWorkingDir, 'log.log'), 'w') as f:
         f.write(stdout)
       if deleteDiff:
         if os.path.exists(os.path.join(currentDir, diffDir)):
           shutil.rmtree(os.path.join(currentDir, diffDir))
       ps, stdout, stderr = do_shell([
-        CP, '-al', currentWorkingDir, destDir,
+        RSYNC, '-a', '--link-dest={}'.format(currentDir), currentDir, destDir,
       ])
       if ps.returncode != 0:
         raise Exception(stderr)
@@ -907,7 +923,7 @@ if __name__ == '__main__':
           remote = True
       if not remote:
         raise Exception('source folder not exists: {}'.format(config['src']))
-  elif args.subparser_name == 'backup-from': # do init
+  elif args.subparser_name == 'backup-to': # do init
     if not os.path.exists(configFile):
       raise Exception('no config file found: {}'.format(configFile))
     print('use config file {} and do clean up'.format(configFile))
@@ -928,7 +944,7 @@ if __name__ == '__main__':
   else:
     raise Exception('should not be here')
 
-  doClean = args.do_clean
+  doClean = args.do_clean or config.get('do_clean')
   # check config file
   try:
     check_config(config=config)
@@ -938,6 +954,8 @@ if __name__ == '__main__':
     config['dest'] = dest[:-1]
   else:
     config['dest'] = dest
+  config['dest'] = os.path.abspath(dest)
+
   #do_unittest(config=config)
   main(config=config, now=now, action=args.subparser_name, doClean=doClean, remote=remote)
 
