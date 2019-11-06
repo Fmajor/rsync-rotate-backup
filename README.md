@@ -41,17 +41,17 @@ The script use 3 criterions to clean old backups
   * each level have three related parameters:
     * max-xx: the max time for backups to stay on this level
     * interval-xx: the interval time of this level
-    * interval-xx: the start tiem of this time
-  * e.g.: `max-hour: 18`, `start-hour: 3`, `interval-hour: 2`
-    * we will get several intervals (start at 3AM, max-age is 18 hour and interval is 2 hour):
-      * `3:00:00 ~ 5:00:00`
-      * `5:00:00 ~ 7:00:00`
-      * `7:00:00 ~ 9:00:00`
-      * `9:00:00 ~ 11:00:00`
-      * `13:00:00 ~ 15:00:00`
-      * `15:00:00 ~ 17:00:00`
+    * start-xx: the start tiem of this time
+  * e.g.: `max-hour: 18`, `interval-hour: 2`, `start-minute: 0`, `start-second: 0`
+    * if now is 20:10:10, we will get several intervals (minute and second start at 00:00 of each hour, max-age is 18 hour and interval is 2 hour):
+      * `19:00:00 ~ 21:00:00` # the latest interval that contains current time
       * `17:00:00 ~ 19:00:00`
-      * `17:00:00 ~ 21:00:00`
+      * `15:00:00 ~ 17:00:00`
+      * `13:00:00 ~ 15:00:00`
+      * `9:00:00 ~ 11:00:00`
+      * `7:00:00 ~ 9:00:00`
+      * `5:00:00 ~ 7:00:00`
+      * `3:00:00 ~ 5:00:00` # the last interval that NOT contain 2:10:10 (now - max_hour)
     * in each interval, we only resive the latest backup and delete others, if they exist.
 
 # Default configs
