@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/bin/env python3
 import os
 import time
 import subprocess
@@ -24,7 +24,7 @@ DESCRIPTION='''Backup data in a rotation mode.'''
 
 TIMEFORMAT = "%Y-%m-%dT%H:%M:%S"
 
-DEFAULT_BACKUP_EXCLUDE='''
+DEFAULT_BACKUP_EXCLUDE='''lost+found
 home/*/.cache
 root/.cache
 home/*/.gvfs
@@ -33,12 +33,14 @@ home/*/.cache/chromium
 home/*/.thumbnails
 home/*/.npm/_cacache
 var/tmp
+var/cache
+proc
+sys
 dev
 run
 tmp
-lost+found
+media
 mnt
-proc
 swapadd
 swapfile
 '''
@@ -844,6 +846,7 @@ def main(*, config=None, now=None, action=None, doClean=None, remote=None):
   print(log)
 
 if __name__ == '__main__':
+  remote = False
   now = datetime.now()
   timestamp = now.strftime(TIMEFORMAT)
   args = parser.parse_args()
