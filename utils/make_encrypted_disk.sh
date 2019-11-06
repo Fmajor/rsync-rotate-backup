@@ -17,6 +17,7 @@ set -e
 # this is the device that you want to format and encrypt, be careful to use the right one!
 # use `lsblk` to view all devices, get the right device ID use `ls -al /dev/disk/by-id`, copy it below
 export DISK_ID_NAME=
+export DISK_LABEL=backup-data
 
 # choose which filesystem to use. Recommend zfs (only if you have installed it!)
 export fstype=zfs # should be zfs or lvm
@@ -66,7 +67,7 @@ if [[ "${doParted}" == "True" ]]; then
 	}
 	expect "(parted) " { send "unit MiB\r" }
 	expect "(parted) " { send "mkpart primary 1 -1\r" }
-	expect "(parted) " { send "name 1 superbloch-data\r" }
+	expect "(parted) " { send "name 1 ${DISK_LABEL}\r" }
 	expect "(parted) " { send "set 1 lvm on\r" }
 	expect "(parted) " { send "p\r" }
 	expect "(parted) " { send "q\r" }
