@@ -55,6 +55,7 @@ diffDir: ../backup-deleteing
 deleteDiff: True
 
 # the backup source when use the 'backup-to' command, should be FULLPATH
+# can also be a remote path, like `remote-host.com:/root`, but you should have copied the ssh pubkey to the remote host
 src: {src}
 
 

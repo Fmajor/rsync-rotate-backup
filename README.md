@@ -86,6 +86,11 @@ start-minute:    0 # 0~59
 start-second:    0 # 0~59
 ```
 
+# Install
+```
+python setup.py install
+```
+
 # Usage
 Example: backup `/` to `/mount/backup/myLaptop`
 ```
@@ -93,7 +98,10 @@ Example: backup `/` to `/mount/backup/myLaptop`
 rsync-rotate-backup init /mount/backup/myLaptop
 cd /mount/backup/myLaptop
 # modify the backup configs and exclude files
+
 vim config.yml # modify `src:` to `src:/`
+# notice that the `src` can also be a remote path, like `remote.com:/root/` (but you should copy the ssh pub key to the remote host)
+
 vim backupExclude.conf # add your own exclude positions
 # notice that we should add /mount into the backupExclude.conf
 # or we will have a cyclic backup
