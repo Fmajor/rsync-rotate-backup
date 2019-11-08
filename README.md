@@ -4,7 +4,7 @@ A python script to do rotation backups using rsync. Just like the Time Machine i
 # Requirements
 * rsync
 * a file system that suport `hard link`, e.g.
-  * `ext4`, `zfs` and other file system used by unix-like OS are supported
+  * `ext4`, `zfs` and other file systems used by unix-like OS are supported
   * `NTFS`, `FAT32` and `exFAT` are not supported!
 
 # Parameters and Behaviors
@@ -95,6 +95,8 @@ cd /mount/backup/myLaptop
 # modify the backup configs and exclude files
 vim config.yml # modify `src:` to `src:/`
 vim backupExclude.conf # add your own exclude positions
+# notice that we should add /mount into the backupExclude.conf
+# or we will have a cyclic backup
 ```
 After these, run `rsync-rotate-backup backup-to /mount/backup/myLaptop` and add it to `cron` with a frequence of `1h`
 
