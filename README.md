@@ -119,3 +119,5 @@ After 3 years, we will get these backups
   * 1 month is the interval, for last 12 months
 * 3 backups in year level:
   * 1 year is the interval, for last 3 yeas
+# Examples
+See doc/examples.md
